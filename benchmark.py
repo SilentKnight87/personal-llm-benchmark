@@ -7,6 +7,8 @@ Evaluates models against real workflows: Clawdbot, Coding, General
 import os
 import json
 import time
+import random
+from dotenv import load_dotenv
 import asyncio
 from datetime import datetime
 from dataclasses import dataclass, asdict
@@ -16,59 +18,47 @@ import httpx
 # API clients
 import anthropic
 import openai
-import google.generativeai as genai
-
-# Token counting
-import tiktoken
 
 # ============================================================================
 # Configuration
 # ============================================================================
 
+load_dotenv()
+
 MODELS = {
-    "claude-opus": {
-        "provider": "anthropic",
-        "model": "claude-sonnet-4-20250514",  # Using Sonnet for benchmark (Opus via subscription)
-        "input_price": 3.0,   # per 1M tokens
-        "output_price": 15.0,
+    "claude-sonnet-4.5": {
+        "provider": "openrouter",
+        "model": "anthropic/claude-sonnet-4.5",
     },
-    "claude-sonnet": {
-        "provider": "anthropic",
-        "model": "claude-sonnet-4-20250514",
-        "input_price": 3.0,
-        "output_price": 15.0,
+    "gpt-5.2": {
+        "provider": "openrouter",
+        "model": "openai/gpt-5.2",
     },
-    "gpt-4o": {
-        "provider": "openai",
-        "model": "gpt-4o",
-        "input_price": 2.5,
-        "output_price": 10.0,
+    "gpt-5-mini": {
+        "provider": "openrouter",
+        "model": "openai/gpt-5-mini",
     },
-    "gpt-4o-mini": {
-        "provider": "openai",
-        "model": "gpt-4o-mini",
-        "input_price": 0.15,
-        "output_price": 0.6,
+    "gemini-3-pro-preview": {
+        "provider": "openrouter",
+        "model": "google/gemini-3-pro-preview",
     },
-    "gemini-2.5-pro": {
-        "provider": "google",
-        "model": "gemini-2.5-pro",
-        "input_price": 1.25,
-        "output_price": 5.0,
+    "gemini-3-flash-preview": {
+        "provider": "openrouter",
+        "model": "google/gemini-3-flash-preview",
     },
-    "gemini-2.5-flash": {
-        "provider": "google",
-        "model": "gemini-2.5-flash",
-        "input_price": 0.15,
-        "output_price": 0.6,
+    "kimi-k2.5": {
+        "provider": "openrouter",
+        "model": "moonshotai/kimi-k2.5",
+        "model_env": "KIMI_MODEL",
+    },
+    "minimax-m2-her": {
+        "provider": "openrouter",
+        "model": "minimax/minimax-m2-her",
+        "model_env": "MINIMAX_MODEL",
     },
 }
 
-SUBSCRIPTIONS = {
-    "claude_max": {"cost": 100, "models": ["claude-opus", "claude-sonnet"]},
-    "chatgpt_plus": {"cost": 20, "models": ["gpt-4o", "gpt-4o-mini"]},
-    "gemini_pro": {"cost": 20, "models": ["gemini-2.5-pro"]},
-}
+SUBSCRIPTIONS: dict = {}
 
 # ============================================================================
 # Test Prompts
@@ -234,7 +224,35 @@ def get_openai_client():
         raise ValueError("OPENAI_API_KEY not set")
     return openai.OpenAI(api_key=api_key)
 
+def get_openrouter_client():
+    api_key = (
+        os.environ.get("OPENROUTER_API_KEY")
+        or os.environ.get("OPENAI_COMPAT_API_KEY")
+        or os.environ.get("KIMI_API_KEY")
+    )
+    base_url = (
+        os.environ.get("OPENROUTER_BASE_URL")
+        or os.environ.get("OPENAI_COMPAT_BASE_URL")
+        or os.environ.get("KIMI_BASE_URL")
+        or "https://openrouter.ai/api/v1"
+    )
+    if not api_key:
+        raise ValueError("OPENROUTER_API_KEY (or OPENAI_COMPAT_API_KEY/KIMI_API_KEY) not set")
+    if not base_url:
+        raise ValueError("OPENROUTER_BASE_URL (or OPENAI_COMPAT_BASE_URL/KIMI_BASE_URL) not set")
+    headers = {}
+    referer = os.environ.get("OPENROUTER_APP_URL") or os.environ.get("OPENROUTER_HTTP_REFERER")
+    title = os.environ.get("OPENROUTER_APP_NAME") or os.environ.get("OPENROUTER_X_TITLE")
+    if referer:
+        headers["HTTP-Referer"] = referer
+    if title:
+        headers["X-Title"] = title
+    if headers:
+        return openai.OpenAI(api_key=api_key, base_url=base_url, default_headers=headers)
+    return openai.OpenAI(api_key=api_key, base_url=base_url)
+
 def get_google_client():
+    import google.generativeai as genai
     api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GOOGLE_API_KEY or GEMINI_API_KEY not set")
@@ -277,27 +295,108 @@ def run_openai(client, model: str, prompt: str) -> tuple[str, float, int, int]:
     
     return text, latency, input_tokens, output_tokens
 
+def _is_retryable_gemini_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return (
+        "rate limit" in message
+        or "resource_exhausted" in message
+        or "quota" in message
+        or "429" in message
+        or "too many requests" in message
+        or "unavailable" in message
+        or "503" in message
+        or "deadline_exceeded" in message
+        or "504" in message
+        or "internal" in message
+        or "500" in message
+    )
+
+def _backoff_delay(attempt: int, initial: float, maximum: float) -> float:
+    delay = min(maximum, initial * (2 ** attempt))
+    jitter = random.uniform(0, delay * 0.1)
+    return delay + jitter
+
 def run_google(model: str, prompt: str) -> tuple[str, float, int, int]:
     """Run prompt through Google Gemini API."""
-    start = time.time()
-    model_obj = genai.GenerativeModel(model)
-    response = model_obj.generate_content(prompt)
-    latency = (time.time() - start) * 1000
+    import tiktoken
+    max_retries = int(os.environ.get("GEMINI_MAX_RETRIES", "4"))
+    initial_backoff = float(os.environ.get("GEMINI_INITIAL_BACKOFF", "2.0"))
+    max_backoff = float(os.environ.get("GEMINI_MAX_BACKOFF", "20.0"))
     
-    text = response.text
-    # Gemini doesn't always return token counts, estimate
-    enc = tiktoken.get_encoding("cl100k_base")
-    input_tokens = len(enc.encode(prompt))
-    output_tokens = len(enc.encode(text))
+    last_error: Optional[Exception] = None
+    for attempt in range(max_retries + 1):
+        try:
+            start = time.time()
+            import google.generativeai as genai
+            model_obj = genai.GenerativeModel(model)
+            response = model_obj.generate_content(prompt)
+            latency = (time.time() - start) * 1000
+            
+            text = response.text
+            # Gemini doesn't always return token counts, estimate
+            enc = tiktoken.get_encoding("cl100k_base")
+            input_tokens = len(enc.encode(prompt))
+            output_tokens = len(enc.encode(text))
+            
+            return text, latency, input_tokens, output_tokens
+        except Exception as e:
+            last_error = e
+            if not _is_retryable_gemini_error(e) or attempt >= max_retries:
+                break
+            delay = _backoff_delay(attempt, initial_backoff, max_backoff)
+            print(f"  ⏳ Gemini rate limit, retrying in {delay:.1f}s...")
+            time.sleep(delay)
     
-    return text, latency, input_tokens, output_tokens
+    if last_error:
+        raise last_error
+    raise RuntimeError("Gemini request failed without error")
 
 # ============================================================================
 # LLM-as-Judge
 # ============================================================================
 
-def judge_response_openai(client, prompt: str, expected: str, response: str) -> tuple[float, float]:
-    """Use GPT-4o to judge response quality. Returns (quality_score, instruction_score)"""
+def _parse_judge_json(text: str) -> dict:
+    if "```" in text:
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    return json.loads(text.strip())
+
+def judge_response_openai(client, prompt: str, expected: str, response: str, model: str = "gpt-4o") -> tuple[float, float]:
+    """Use OpenAI model to judge response quality. Returns (quality_score, instruction_score)"""
+    judge_prompt = f"""You are evaluating an LLM response for a personal benchmark.
+
+**Original Prompt:** {prompt}
+
+**Expected Behavior:** {expected}
+
+**Model Response:** {response}
+
+Rate the response on a scale of 1-5 for each criterion:
+
+1. **Quality** (1-5): Is this a high-quality, useful response?
+2. **Instruction Following** (1-5): Did it do what was asked?
+
+    Respond in JSON format only:
+{{"quality": <1-5>, "instruction": <1-5>, "notes": "<brief explanation>"}}"""
+
+    try:
+        result = client.chat.completions.create(
+            model=model,
+            max_tokens=256,
+            messages=[{"role": "user", "content": judge_prompt}]
+        )
+        
+        # Parse JSON from response
+        text = result.choices[0].message.content
+        data = _parse_judge_json(text)
+        return float(data["quality"]), float(data["instruction"])
+    except Exception as e:
+        print(f"  ⚠️ Judge error: {e}")
+        return 3.0, 3.0  # Default middle score
+
+def judge_response_anthropic(client, prompt: str, expected: str, response: str, model: str = "claude-sonnet-4-20250514") -> tuple[float, float]:
+    """Use Anthropic model to judge response quality. Returns (quality_score, instruction_score)"""
     judge_prompt = f"""You are evaluating an LLM response for a personal benchmark.
 
 **Original Prompt:** {prompt}
@@ -315,36 +414,28 @@ Respond in JSON format only:
 {{"quality": <1-5>, "instruction": <1-5>, "notes": "<brief explanation>"}}"""
 
     try:
-        result = client.chat.completions.create(
-            model="gpt-4o",
+        result = client.messages.create(
+            model=model,
             max_tokens=256,
             messages=[{"role": "user", "content": judge_prompt}]
         )
         
-        # Parse JSON from response
-        text = result.choices[0].message.content
-        # Handle potential markdown code blocks
-        if "```" in text:
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        
-        data = json.loads(text.strip())
+        text = result.content[0].text
+        data = _parse_judge_json(text)
         return float(data["quality"]), float(data["instruction"])
     except Exception as e:
         print(f"  ⚠️ Judge error: {e}")
         return 3.0, 3.0  # Default middle score
 
 # ============================================================================
-# Cost Calculation
+# Model Helpers
 # ============================================================================
 
-def calculate_cost(model_key: str, input_tokens: int, output_tokens: int) -> float:
-    """Calculate cost in USD for a query."""
-    config = MODELS[model_key]
-    input_cost = (input_tokens / 1_000_000) * config["input_price"]
-    output_cost = (output_tokens / 1_000_000) * config["output_price"]
-    return input_cost + output_cost
+def _resolve_model_name(config: dict) -> str:
+    env_key = config.get("model_env")
+    if env_key:
+        return os.environ.get(env_key, config["model"])
+    return config["model"]
 
 # ============================================================================
 # Main Benchmark Runner
@@ -354,7 +445,14 @@ def run_benchmark(models_to_test: list[str] = None, categories: list[str] = None
     """Run the full benchmark suite."""
     
     if models_to_test is None:
-        models_to_test = ["claude-sonnet", "gpt-4o-mini", "gemini-2.5-pro"]
+        models_to_test = [
+            "claude-sonnet-4.5",
+            "gpt-5.2",
+            "gpt-5-mini",
+            "gemini-3-flash-preview",
+            "kimi-k2.5",
+            "minimax-m2-her",
+        ]
     
     if categories is None:
         categories = ["clawdbot", "coding", "general"]
@@ -367,25 +465,40 @@ def run_benchmark(models_to_test: list[str] = None, categories: list[str] = None
     print(f"Started: {datetime.now().isoformat()}")
     print("=" * 60)
     
-    # Initialize clients
+    judge_provider = os.environ.get("JUDGE_PROVIDER", "anthropic").lower()
+    judge_model = os.environ.get("JUDGE_MODEL")
+    providers_needed = {
+        MODELS[m]["provider"] for m in models_to_test if m in MODELS
+    }
+    if judge_provider in {"anthropic", "openai"}:
+        providers_needed.add(judge_provider)
+
+    # Initialize clients only when needed
     clients = {}
-    try:
-        clients["anthropic"] = get_anthropic_client()
-        print("✅ Anthropic client ready")
-    except Exception as e:
-        print(f"❌ Anthropic: {e}")
-    
-    try:
-        clients["openai"] = get_openai_client()
-        print("✅ OpenAI client ready")
-    except Exception as e:
-        print(f"❌ OpenAI: {e}")
-    
-    try:
-        clients["google"] = get_google_client()
-        print("✅ Google client ready")
-    except Exception as e:
-        print(f"❌ Google: {e}")
+    if "anthropic" in providers_needed:
+        try:
+            clients["anthropic"] = get_anthropic_client()
+            print("✅ Anthropic client ready")
+        except Exception as e:
+            print(f"❌ Anthropic: {e}")
+    if "openai" in providers_needed:
+        try:
+            clients["openai"] = get_openai_client()
+            print("✅ OpenAI client ready")
+        except Exception as e:
+            print(f"❌ OpenAI: {e}")
+    if "openrouter" in providers_needed:
+        try:
+            clients["openrouter"] = get_openrouter_client()
+            print("✅ OpenRouter client ready")
+        except Exception as e:
+            print(f"❌ OpenRouter: {e}")
+    if "google" in providers_needed:
+        try:
+            clients["google"] = get_google_client()
+            print("✅ Google client ready")
+        except Exception as e:
+            print(f"❌ Google: {e}")
     
     print()
     
@@ -398,6 +511,7 @@ def run_benchmark(models_to_test: list[str] = None, categories: list[str] = None
         
         config = MODELS[model_key]
         provider = config["provider"]
+        model_name = _resolve_model_name(config)
         
         if provider not in clients:
             print(f"⚠️ Skipping {model_key} (no {provider} client)")
@@ -421,26 +535,39 @@ def run_benchmark(models_to_test: list[str] = None, categories: list[str] = None
                     # Run the model
                     if provider == "anthropic":
                         response, latency, in_tok, out_tok = run_anthropic(
-                            clients["anthropic"], config["model"], prompt
+                            clients["anthropic"], model_name, prompt
                         )
                     elif provider == "openai":
                         response, latency, in_tok, out_tok = run_openai(
-                            clients["openai"], config["model"], prompt
+                            clients["openai"], model_name, prompt
+                        )
+                    elif provider == "openrouter":
+                        response, latency, in_tok, out_tok = run_openai(
+                            clients["openrouter"], model_name, prompt
                         )
                     elif provider == "google":
                         response, latency, in_tok, out_tok = run_google(
-                            config["model"], prompt
+                            model_name, prompt
                         )
                     else:
                         raise ValueError(f"Unknown provider: {provider}")
                     
-                    # Calculate cost
-                    cost = calculate_cost(model_key, in_tok, out_tok)
-                    
-                    # Judge quality (using GPT-4o)
-                    if "openai" in clients:
+                    # Judge quality (using configured judge)
+                    if judge_provider == "anthropic" and "anthropic" in clients:
+                        quality, instruction = judge_response_anthropic(
+                            clients["anthropic"],
+                            prompt,
+                            expected,
+                            response,
+                            model=judge_model or "claude-sonnet-4-20250514",
+                        )
+                    elif judge_provider == "openai" and "openai" in clients:
                         quality, instruction = judge_response_openai(
-                            clients["openai"], prompt, expected, response
+                            clients["openai"],
+                            prompt,
+                            expected,
+                            response,
+                            model=judge_model or "gpt-4o",
                         )
                     else:
                         quality, instruction = 3.0, 3.0
@@ -454,12 +581,12 @@ def run_benchmark(models_to_test: list[str] = None, categories: list[str] = None
                         latency_ms=latency,
                         input_tokens=in_tok,
                         output_tokens=out_tok,
-                        cost_usd=cost,
+                        cost_usd=0.0,
                         quality_score=quality,
                         instruction_score=instruction,
                     )
                     
-                    print(f"✅ Q:{quality:.1f} I:{instruction:.1f} ${cost:.4f} {latency:.0f}ms")
+                    print(f"✅ Q:{quality:.1f} I:{instruction:.1f} {latency:.0f}ms")
                     
                 except Exception as e:
                     result = BenchmarkResult(
@@ -485,120 +612,226 @@ def run_benchmark(models_to_test: list[str] = None, categories: list[str] = None
 # ============================================================================
 
 def generate_report(results: list[BenchmarkResult]) -> str:
-    """Generate markdown report from results."""
-    
-    report = []
-    report.append("# 🧪 Peter's Personal LLM Benchmark Results")
-    report.append(f"\n**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    report.append(f"**Tests Run:** {len(results)}")
-    
+    """Generate a simple HTML report from results (scores only)."""
+    def avg(values: list[float]) -> float:
+        return sum(values) / len(values) if values else 0.0
+
     # Group by model
-    models = {}
+    models: dict[str, list[BenchmarkResult]] = {}
     for r in results:
-        if r.model not in models:
-            models[r.model] = []
-        models[r.model].append(r)
-    
-    # Summary table
-    report.append("\n## 📊 Summary\n")
-    report.append("| Model | Avg Quality | Avg Instruction | Avg Latency | Total Cost |")
-    report.append("|-------|-------------|-----------------|-------------|------------|")
-    
-    model_scores = {}
+        models.setdefault(r.model, []).append(r)
+
+    # Summary scores
+    model_scores: dict[str, dict[str, float]] = {}
     for model, model_results in models.items():
         valid = [r for r in model_results if r.error is None]
         if not valid:
             continue
-        
-        avg_quality = sum(r.quality_score or 0 for r in valid) / len(valid)
-        avg_instruction = sum(r.instruction_score or 0 for r in valid) / len(valid)
-        avg_latency = sum(r.latency_ms for r in valid) / len(valid)
-        total_cost = sum(r.cost_usd for r in valid)
-        
+        avg_quality = avg([r.quality_score or 0 for r in valid])
+        avg_instruction = avg([r.instruction_score or 0 for r in valid])
+        score = avg([avg_quality, avg_instruction])
         model_scores[model] = {
             "quality": avg_quality,
             "instruction": avg_instruction,
-            "latency": avg_latency,
-            "cost": total_cost,
+            "score": score,
         }
-        
-        report.append(f"| {model} | {avg_quality:.2f}/5 | {avg_instruction:.2f}/5 | {avg_latency:.0f}ms | ${total_cost:.4f} |")
-    
-    # Category breakdown
-    report.append("\n## 📂 By Category\n")
-    
+
+    # Sort by overall score desc
+    sorted_models = sorted(model_scores.items(), key=lambda x: x[1]["score"], reverse=True)
+
+    def score_class(value: float) -> str:
+        if value >= 4.5:
+            return "score score-high"
+        if value >= 3.5:
+            return "score score-mid"
+        return "score score-low"
+
+    def row_html(cols: list[str]) -> str:
+        return "<tr>" + "".join(f"<td>{c}</td>" for c in cols) + "</tr>"
+
+    summary_rows = []
+    for model, scores in sorted_models:
+        summary_rows.append(
+            row_html([
+                model,
+                f"<span class='{score_class(scores['score'])}'>{scores['score']:.2f}</span>",
+                f"{scores['quality']:.2f}",
+                f"{scores['instruction']:.2f}",
+            ])
+        )
+
+    category_sections = []
     for category in ["clawdbot", "coding", "general"]:
-        report.append(f"\n### {category.title()}\n")
-        report.append("| Model | Quality | Instruction | Cost |")
-        report.append("|-------|---------|-------------|------|")
-        
-        for model in models:
-            cat_results = [r for r in models[model] if r.category == category and r.error is None]
+        rows = []
+        for model, model_results in models.items():
+            cat_results = [r for r in model_results if r.category == category and r.error is None]
             if not cat_results:
                 continue
-            
-            avg_q = sum(r.quality_score or 0 for r in cat_results) / len(cat_results)
-            avg_i = sum(r.instruction_score or 0 for r in cat_results) / len(cat_results)
-            cost = sum(r.cost_usd for r in cat_results)
-            
-            report.append(f"| {model} | {avg_q:.2f}/5 | {avg_i:.2f}/5 | ${cost:.4f} |")
-    
-    # Subscription ROI Analysis
-    report.append("\n## 💰 Subscription ROI Analysis\n")
-    report.append("Based on this benchmark run (extrapolated to monthly usage):\n")
-    
-    # Estimate monthly usage (assume 30 queries/day = 900/month)
-    queries_per_month = 900
-    tests_per_model = len(results) // len(models) if models else 1
-    
-    for sub_name, sub_info in SUBSCRIPTIONS.items():
-        report.append(f"\n### {sub_name.replace('_', ' ').title()} (${sub_info['cost']}/mo)\n")
-        
-        for model in sub_info["models"]:
-            if model in model_scores:
-                scores = model_scores[model]
-                cost_per_query = scores["cost"] / tests_per_model if tests_per_model > 0 else 0
-                monthly_api_cost = cost_per_query * queries_per_month
-                savings = monthly_api_cost - sub_info["cost"]
-                
-                if savings > 0:
-                    verdict = f"✅ Subscription saves ${savings:.2f}/mo"
-                else:
-                    verdict = f"❌ API would save ${-savings:.2f}/mo"
-                
-                report.append(f"- **{model}:** ${cost_per_query:.4f}/query → ${monthly_api_cost:.2f}/mo API cost")
-                report.append(f"  - {verdict}")
-    
-    # Recommendations
-    report.append("\n## 🎯 Recommendations\n")
-    
-    if model_scores:
-        best_quality = max(model_scores.items(), key=lambda x: x[1]["quality"])
-        best_value = max(model_scores.items(), key=lambda x: x[1]["quality"] / (x[1]["cost"] + 0.001))
-        fastest = min(model_scores.items(), key=lambda x: x[1]["latency"])
-        
-        report.append(f"- **Best Quality:** {best_quality[0]} ({best_quality[1]['quality']:.2f}/5)")
-        report.append(f"- **Best Value:** {best_value[0]} (quality/cost ratio)")
-        report.append(f"- **Fastest:** {fastest[0]} ({fastest[1]['latency']:.0f}ms avg)")
-    
-    # Raw results
-    report.append("\n## 📋 Detailed Results\n")
-    report.append("<details>")
-    report.append("<summary>Click to expand full results</summary>\n")
-    
-    for r in results:
-        report.append(f"### {r.model} / {r.category} / {r.test_name}")
-        if r.error:
-            report.append(f"**Error:** {r.error}")
-        else:
-            report.append(f"- Quality: {r.quality_score}/5 | Instruction: {r.instruction_score}/5")
-            report.append(f"- Latency: {r.latency_ms:.0f}ms | Cost: ${r.cost_usd:.4f}")
-            report.append(f"- Tokens: {r.input_tokens} in / {r.output_tokens} out")
-            report.append(f"\n**Response:**\n```\n{r.response}\n```\n")
-    
-    report.append("</details>")
-    
-    return "\n".join(report)
+            avg_q = avg([r.quality_score or 0 for r in cat_results])
+            avg_i = avg([r.instruction_score or 0 for r in cat_results])
+            score = avg([avg_q, avg_i])
+            rows.append(
+                row_html([
+                    model,
+                    f"<span class='{score_class(score)}'>{score:.2f}</span>",
+                    f"{avg_q:.2f}",
+                    f"{avg_i:.2f}",
+                ])
+            )
+        section = f"""
+        <section class="card">
+          <h2>{category.title()}</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Model</th><th>Score</th><th>Quality</th><th>Instruction</th></tr>
+              </thead>
+              <tbody>
+                {''.join(rows) if rows else '<tr><td colspan="4">No results</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+        </section>
+        """
+        category_sections.append(section)
+
+    date_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+    tests_run = len(results)
+
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Personal LLM Benchmark</title>
+  <style>
+    :root {{
+      --bg: #0b0f16;
+      --card: #121826;
+      --text: #e8edf6;
+      --muted: #9aa6b2;
+      --accent: #7dd3fc;
+      --border: #1f2937;
+      --high: #22c55e;
+      --mid: #f59e0b;
+      --low: #ef4444;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Helvetica, Arial, sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #1b2335, transparent), var(--bg);
+      color: var(--text);
+    }}
+    .container {{
+      max-width: 1100px;
+      margin: 40px auto 64px;
+      padding: 0 20px;
+    }}
+    header {{
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 24px;
+    }}
+    h1 {{
+      margin: 0;
+      font-size: 28px;
+      letter-spacing: 0.2px;
+    }}
+    .meta {{
+      color: var(--muted);
+      font-size: 14px;
+    }}
+    .card {{
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px 18px 12px;
+      margin-bottom: 18px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    }}
+    h2 {{
+      margin: 0 0 12px 0;
+      font-size: 18px;
+      color: var(--accent);
+      letter-spacing: 0.3px;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }}
+    th, td {{
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--border);
+    }}
+    th {{
+      color: var(--muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 12px;
+      letter-spacing: 0.6px;
+    }}
+    .table-wrap {{
+      overflow-x: auto;
+    }}
+    .score {{
+      display: inline-block;
+      min-width: 62px;
+      text-align: center;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-weight: 600;
+      font-size: 12px;
+      color: #0b0f16;
+    }}
+    .score-high {{ background: var(--high); }}
+    .score-mid {{ background: var(--mid); }}
+    .score-low {{ background: var(--low); }}
+    footer {{
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 18px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🧪 Personal LLM Benchmark</h1>
+      <div class="meta">Run: {date_str} · Tests: {tests_run}</div>
+    </header>
+
+    <section class="card">
+      <h2>Summary</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th>Score</th>
+              <th>Quality</th>
+              <th>Instruction</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(summary_rows) if summary_rows else '<tr><td colspan="4">No results</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    {''.join(category_sections)}
+
+    <footer>Score = average of Quality and Instruction.</footer>
+  </div>
+</body>
+</html>
+"""
+    return html
 
 # ============================================================================
 # Main
@@ -607,8 +840,8 @@ def generate_report(results: list[BenchmarkResult]) -> str:
 if __name__ == "__main__":
     import sys
     
-    # Default to testing cheaper models for initial run
-    models = sys.argv[1:] if len(sys.argv) > 1 else ["claude-sonnet", "gpt-4o-mini"]
+    # Use default model list unless arguments are provided
+    models = sys.argv[1:] if len(sys.argv) > 1 else None
     
     print("🚀 Starting benchmark...")
     results = run_benchmark(models_to_test=models)
@@ -619,7 +852,7 @@ if __name__ == "__main__":
     report = generate_report(results)
     
     # Save report
-    report_path = os.path.expanduser("~/Documents/Code/personal-llm-benchmark/results.md")
+    report_path = os.path.expanduser("~/Documents/Code/personal-llm-benchmark/results.html")
     with open(report_path, "w") as f:
         f.write(report)
     
@@ -632,6 +865,6 @@ if __name__ == "__main__":
     
     print(f"✅ Raw data saved to: {json_path}")
     
-    # Print summary
+    # Print a short note
     print("\n" + "=" * 60)
-    print(report.split("## 📂")[0])  # Print just summary
+    print("Open results.html to view the benchmark summary.")
